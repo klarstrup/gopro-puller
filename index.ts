@@ -75,10 +75,8 @@ async function getDeviceNameFromFile(videoPath: string): Promise<string> {
   return DEVC.DVNM;
 }
 
-const sessionName = `2025-02-24-Io-Drumming`;
+const sessionName = `2025-05-01-Exelerate-Soenderjyllandshallen`;
 const destinationFolder = `/Volumes/@klarstrup2/${sessionName}`;
-
-throw new Error("Not implemented");
 
 const multi = new Multiprogress();
 console.time("Total time");
@@ -103,14 +101,27 @@ await Promise.all(
 
         const dirFiles = await fs.readdir(`/Volumes/${volume}/DCIM/${dir}`);
 
-        let newestFile: { mtimeMs: number; file: string } | null = null;
+        let newestFile: {
+          vidNumber?: number;
+          mtimeMs?: number;
+          file: string;
+        } | null = null;
         for (const file of dirFiles) {
           if (!file.endsWith(".MP4")) continue;
           const filePath = `/Volumes/${volume}/DCIM/${dir}/${file}`;
 
-          const stats = await fs.stat(filePath);
-          if (newestFile === null || stats.mtimeMs > newestFile.mtimeMs) {
-            newestFile = { mtimeMs: stats.mtimeMs, file: filePath };
+          if (file.startsWith("DSC_")) {
+            const stats = await fs.stat(filePath);
+            if (newestFile === null || stats.mtimeMs > newestFile.mtimeMs) {
+              newestFile = { mtimeMs: stats.mtimeMs, file: filePath };
+            }
+          } else {
+            const [, chapterNumber, vidNumber] = file
+              .match(/(\d{2})(\d{4})/)
+              .map(Number);
+            if (newestFile === null || vidNumber > newestFile.vidNumber) {
+              newestFile = { vidNumber: vidNumber, file: filePath };
+            }
           }
         }
 
@@ -121,6 +132,7 @@ await Promise.all(
               ""
             )
           : "NikonZ30";
+        console.log(`Found camera name ${cameraName} for ${newestFile.file}`);
 
         if (!videosByCamera[cameraName])
           videosByCamera[cameraName] = { videos: [] };
@@ -138,79 +150,97 @@ await Promise.all(
 console.timeEnd("Scan time");
 
 console.time("Copy/Concatenate time");
-console.log("Creating destination folder...");
+console.log(`Creating destination folder ${destinationFolder}...`);
 await fs.mkdir(destinationFolder, { recursive: true });
-console.log("Copying videos...");
-for (const [camera, { videos }] of Object.entries(videosByCamera)) {
-  const destinationFile = `${destinationFolder}/${sessionName}-${camera}.MP4`;
-  const destinationStat: Stats | null = await fs
-    .stat(destinationFile)
-    .catch(() => null);
+console.log(`Copying videos to ${destinationFolder}...`);
+await Promise.all(
+  Object.entries(videosByCamera).map(async ([camera, { videos }]) => {
+    const destinationFile = `${destinationFolder}/${sessionName}-${camera}.MP4`;
+    const destinationStat: Stats | null = await fs
+      .stat(destinationFile)
+      .catch(() => null);
 
-  if (videos.length === 1) {
-    const onlyVideo = videos[0];
-    const sourceStat = await fs.stat(onlyVideo);
+    if (videos.length === 1) {
+      const onlyVideo = videos[0];
+      const sourceStat = await fs.stat(onlyVideo);
 
-    const bar = multi.newBar(
-      `Copying ${destinationFile} [:bar] :percent :etas`,
-      { total: sourceStat.size }
-    );
+      if (destinationStat && sourceStat.size <= destinationStat.size) {
+        console.log(
+          `Already copied ${destinationFile.replace(
+            destinationFolder + "/",
+            ""
+          )}`
+        );
+        return;
+      }
 
-    if (destinationStat && sourceStat.size <= destinationStat.size) {
-      console.log(`Already copied ${destinationFile}`);
-      continue;
+      const bar = multi.newBar(
+        `Copying ${destinationFile.replace(
+          destinationFolder + "/",
+          ""
+        )} [:bar] :percent :etas`,
+        { total: sourceStat.size }
+      );
+
+      await copyFile(onlyVideo, destinationFile, {
+        onProgress: ({ writtenBytes, size }) => bar.update(writtenBytes / size),
+      });
+
+      return;
     }
 
-    await copyFile(onlyVideo, destinationFile, {
-      onProgress: ({ writtenBytes, size }) => bar.update(writtenBytes / size),
+    let totalDuration = 0;
+    const ffmpegCommand = ffmpeg();
+    for (const video of videos) {
+      totalDuration += +(await ffprobe(video)).format.duration;
+      ffmpegCommand.input(video);
+    }
+
+    if (destinationStat) {
+      const destinationDuration = +(await ffprobe(destinationFile)).format
+        .duration;
+
+      if (~~destinationDuration === ~~totalDuration) {
+        console.log(
+          `Already concatenated ${destinationFile.replace(
+            destinationFolder + "/",
+            ""
+          )}`
+        );
+        return;
+      }
+    }
+
+    if (process.env.DEBUG) {
+      console.log("ffmpeg " + ffmpegCommand._getArguments().join(" "));
+    }
+
+    let bar: ProgressBar;
+    await new Promise((resolve, reject) => {
+      ffmpegCommand
+        .on("progress", (progress) => {
+          if (!bar) {
+            bar = multi.newBar(
+              `Concatenating ${destinationFile.replace(
+                destinationFolder + "/",
+                ""
+              )} [:bar] :percent :etas`,
+              { total: totalDuration }
+            );
+          }
+
+          bar.update(timemarkToSeconds(progress.timemark) / totalDuration);
+        })
+        .on("end", () => {
+          bar.update(1);
+          bar.complete = true;
+          resolve(undefined);
+        })
+        .on("error", reject)
+        .mergeToFile(destinationFile, "/tmp");
     });
-
-    continue;
-  }
-
-  let totalDuration = 0;
-  const ffmpegCommand = ffmpeg();
-  for (const video of videos) {
-    totalDuration += +(await ffprobe(video)).format.duration;
-    ffmpegCommand.input(video);
-  }
-
-  if (destinationStat) {
-    const destinationDuration = +(await ffprobe(destinationFile)).format
-      .duration;
-
-    if (~~destinationDuration === ~~totalDuration) {
-      console.log(`Already concatenated ${destinationFile}`);
-      continue;
-    }
-  }
-
-  if (process.env.DEBUG) {
-    console.log("ffmpeg " + ffmpegCommand._getArguments().join(" "));
-  }
-
-  let bar: ProgressBar;
-  await new Promise((resolve, reject) => {
-    ffmpegCommand
-      .on("progress", (progress) => {
-        if (!bar) {
-          bar = multi.newBar(
-            `Concatenating ${destinationFile} [:bar] :percent :etas`,
-            { total: totalDuration }
-          );
-        }
-
-        bar.update(timemarkToSeconds(progress.timemark) / totalDuration);
-      })
-      .on("end", () => {
-        bar.update(1);
-        bar.complete = true;
-        resolve(undefined);
-      })
-      .on("error", reject)
-      .mergeToFile(destinationFile, "/tmp");
-  });
-}
+  })
+);
 
 console.timeEnd("Copy/Concatenate time");
 console.timeEnd("Total time");
