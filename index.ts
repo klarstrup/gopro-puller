@@ -1,26 +1,36 @@
 #!/usr/bin/env -S npx tsx
 
 import { copyFile } from "copy-file";
-import ffprobe from "ffprobe-client";
 import ffmpeg from "fluent-ffmpeg";
-import { Stats } from "fs";
-import fs from "fs/promises";
-import { GoProTelemetry } from "gopro-telemetry";
+import type { Stats } from "fs";
+import inquirer from "inquirer";
 import Multiprogress from "multi-progress";
+import { execFile } from "node:child_process";
+import fs from "node:fs/promises";
 
-const extractGPMF = async (videoFile: string) => {
-  for (const stream of (await ffprobe(videoFile)).streams) {
-    if (stream.codec_tag_string !== "gpmd") continue;
+const getDuration = (target: string): Promise<number> =>
+  new Promise((resolve, reject) =>
+    execFile(
+      "ffprobe",
+      ["-i", target, "-print_format", "json", "-show_format"],
+      (err, stdout, stderr) => {
+        if (err) {
+          if (err.code === "ENOENT") {
+            reject(err);
+          } else {
+            reject(new Error(stderr));
+          }
+        } else {
+          resolve(Number(JSON.parse(stdout).format.duration));
+        }
+      }
+    )
+  );
 
-    return extractGPMFAt(videoFile, stream.index);
-  }
-};
 function timemarkToSeconds(timemark: string) {
-  if (typeof timemark === "number") {
-    return timemark;
-  }
+  if (typeof timemark === "number") return timemark;
 
-  if (timemark.indexOf(":") === -1 && timemark.indexOf(".") >= 0) {
+  if (!timemark.includes(":") && timemark.indexOf(".") >= 0) {
     return Number(timemark);
   }
 
@@ -42,126 +52,196 @@ function timemarkToSeconds(timemark: string) {
   return secs;
 }
 
-const extractGPMFAt = async (
-  videoFile: string,
-  stream: number,
-  buffer: Buffer<ArrayBuffer> = Buffer.alloc(0)
-) =>
-  new Promise<Buffer<ArrayBuffer>>((resolve, reject) =>
-    ffmpeg(videoFile)
-      .outputOption("-y")
-      .outputOptions("-codec copy")
-      .outputOptions(`-map 0:${stream}`)
-      .outputOption("-f rawvideo")
-      .on("error", reject)
-      .pipe()
-      .on("data", (chunk) => (buffer = Buffer.concat([buffer, chunk])))
-      .on("end", () => resolve(buffer))
-  );
+function secondsToTimemark(seconds: number) {
+  const pad = (num: number) => (num < 10 ? `0${num}` : num);
 
-async function getDeviceNameFromFile(videoPath: string): Promise<string> {
-  const telemetry = await GoProTelemetry(
-    { rawData: await extractGPMF(videoPath) },
-    { raw: true }
-  );
+  const H = pad(Math.floor(seconds / 3600));
+  const i = pad(Math.floor((seconds % 3600) / 60));
+  const s = pad(seconds % 60);
 
-  // @ts-expect-error - The type definitions are wrong
-  const DEVC = Array.isArray(telemetry.DEVC)
-    ? // @ts-expect-error - The type definitions are wrong
-      telemetry.DEVC[0]
-    : // @ts-expect-error - The type definitions are wrong
-      telemetry.DEVC;
-
-  return DEVC.DVNM;
+  return `${H}:${i}:${s}`;
 }
 
-const sessionName = `2025-05-01-Exelerate-Soenderjyllandshallen`;
+async function getDeviceNameFromFile(videoPath: string): Promise<string> {
+  const regexDeviceName = new Promise<string>((resolve, reject) => {
+    const ffmpegCommand = ffmpeg(videoPath)
+      .outputOption("-y")
+      .outputOptions("-codec copy")
+      // Stream 3 is the GPMF stream
+      .outputOptions(`-map 0:3`)
+      .outputOption("-f rawvideo")
+      .on("error", reject);
+
+    return ffmpegCommand
+      .pipe()
+      .on("data", (chunk) => {
+        const deviceName = chunk
+          .toString("utf8")
+          .match(/DVNMc(.+)STRM/u)?.[1]
+          ?.replace(/[^a-zA-Z0-9]/g, "");
+        if (deviceName) {
+          ffmpegCommand.kill("SIGKILL");
+          resolve(deviceName);
+        }
+      })
+      .on("end", () => reject("Failed to get the camera name"));
+  });
+  return regexDeviceName || "Unknown Device";
+}
+
+const sessionName = `2025-08-07-Exelerate-HftH-Single-Guitar-Solos`;
 const destinationFolder = `/Volumes/@klarstrup2/${sessionName}`;
+
+const allVolumes = await fs.readdir(`/Volumes/`);
+const { selectedVolumes } = await inquirer.prompt<{
+  selectedVolumes: string[];
+}>([
+  {
+    type: "checkbox",
+    name: "selectedVolumes",
+    message: "Pick volumes to pull videos from",
+    choices: allVolumes,
+    default: allVolumes.filter((volume) => volume.startsWith("Untitled")),
+  },
+]);
 
 const multi = new Multiprogress();
 console.time("Total time");
 console.time("Scan time");
 console.log("Scanning for videos...");
-const videosByCamera: Record<
+const videosByVolume: Record<
   string,
   {
-    videos: string[];
-  }
+    volume: string;
+    chapterFilePaths: string[];
+    cameraName: string;
+    date: Date;
+    vidNumber?: number;
+    totalDuration?: number;
+  }[]
 > = {};
 await Promise.all(
-  (
-    await fs.readdir("/Volumes/")
-  ).map(async (volume) => {
-    if (!volume.startsWith("Untitled")) return;
+  selectedVolumes.map(async (volume) => {
+    if (!videosByVolume[volume]) videosByVolume[volume] = [];
 
-    const dirs = await fs.readdir(`/Volumes/${volume}/DCIM`);
     await Promise.all(
-      dirs.map(async (dir) => {
-        if (!dir.startsWith("100")) return;
-
-        const dirFiles = await fs.readdir(`/Volumes/${volume}/DCIM/${dir}`);
-
-        let newestFile: {
-          vidNumber?: number;
-          mtimeMs?: number;
-          file: string;
-        } | null = null;
-        for (const file of dirFiles) {
-          if (!file.endsWith(".MP4")) continue;
-          const filePath = `/Volumes/${volume}/DCIM/${dir}/${file}`;
-
-          if (file.startsWith("DSC_")) {
-            const stats = await fs.stat(filePath);
-            if (newestFile === null || stats.mtimeMs > newestFile.mtimeMs) {
-              newestFile = { mtimeMs: stats.mtimeMs, file: filePath };
-            }
-          } else {
-            const [, chapterNumber, vidNumber] = file
-              .match(/(\d{2})(\d{4})/)
-              .map(Number);
-            if (newestFile === null || vidNumber > newestFile.vidNumber) {
-              newestFile = { vidNumber: vidNumber, file: filePath };
-            }
-          }
-        }
-
-        console.log(`Getting device name for ${newestFile.file}`);
-        const cameraName = dir.includes("GOPRO")
-          ? (await getDeviceNameFromFile(newestFile.file)).replace(
-              /[^a-zA-Z0-9]/g,
-              ""
+      (
+        await fs.readdir(`/Volumes/${volume}/DCIM`)
+      )
+        .filter((dir) => dir.startsWith("100"))
+        .map(async (dir) =>
+          Promise.all(
+            (
+              await fs.readdir(`/Volumes/${volume}/DCIM/${dir}`)
             )
-          : "NikonZ30";
-        console.log(`Found camera name ${cameraName} for ${newestFile.file}`);
+              .filter((fileName) => fileName.endsWith(".MP4"))
+              .map(async (fileName) => {
+                const filePath = `/Volumes/${volume}/DCIM/${dir}/${fileName}`;
+                const stats = await fs.stat(filePath);
 
-        if (!videosByCamera[cameraName])
-          videosByCamera[cameraName] = { videos: [] };
-        for (const file of dirFiles) {
-          if (!file.endsWith(newestFile.file.slice(-8))) continue;
+                const [, vidNumber] = fileName
+                  .match(/\d{2}(\d{4})/)
+                  .map(Number);
 
-          const filePath = `/Volumes/${volume}/DCIM/${dir}/${file}`;
+                let cameraName =
+                  videosByVolume[volume].find((v) => v.vidNumber === vidNumber)
+                    ?.cameraName ||
+                  (dir.includes("GOPRO")
+                    ? await getDeviceNameFromFile(filePath)
+                    : "NikonZ30");
 
-          videosByCamera[cameraName].videos.push(filePath);
-        }
-      })
+                if (
+                  !videosByVolume[volume].some((v) => v.vidNumber === vidNumber)
+                ) {
+                  videosByVolume[volume].push({
+                    volume,
+                    chapterFilePaths: [],
+                    cameraName,
+                    date: new Date(stats.mtimeMs),
+                    vidNumber,
+                    totalDuration: 0,
+                  });
+                }
+
+                videosByVolume[volume]
+                  .find((v) => v.vidNumber === vidNumber)
+                  .chapterFilePaths.push(filePath);
+              })
+          )
+        )
     );
   })
 );
 console.timeEnd("Scan time");
 
+console.time("Getting video durations");
+await Promise.all(
+  Object.keys(videosByVolume).map((volume) =>
+    Promise.all(
+      videosByVolume[volume].map(({ chapterFilePaths, totalDuration }) =>
+        Promise.all(
+          chapterFilePaths.map((path) =>
+            getDuration(path).then((dur) => (totalDuration += dur))
+          )
+        )
+      )
+    )
+  )
+);
+console.timeEnd("Getting video durations");
+
+const selections = await inquirer.prompt<
+  Record<string, (typeof videosByVolume)[keyof typeof videosByVolume]>
+>(
+  Object.entries(videosByVolume).map(([volume, videos]) => ({
+    type: "checkbox",
+    name: volume,
+    message: `Select videos to pull from ${volume}`,
+    choices: videos
+      .sort((a, b) => b.date.valueOf() - a.date.valueOf())
+      .map((v) => ({
+        name: `Timestamp: ${v.date.toLocaleString("da-DK", {
+          day: "2-digit",
+          month: "2-digit",
+          year: "numeric",
+          hour12: false,
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+        })}. Duration: ${secondsToTimemark(~~v.totalDuration)}. Camera: ${
+          v.cameraName
+        }. Vid No.: ${v.vidNumber}`,
+        value: v,
+      })),
+  }))
+);
+const selectedVideos = Object.values(selections).flat();
+
+// throw new Error("dry run - remove this line");
+
 console.time("Copy/Concatenate time");
 console.log(`Creating destination folder ${destinationFolder}...`);
 await fs.mkdir(destinationFolder, { recursive: true });
 console.log(`Copying videos to ${destinationFolder}...`);
+
+const areThereMultipleVideosFromTheSameCamera = selectedVideos.some(
+  ({ cameraName }, _, videos) =>
+    videos.filter((v) => v.cameraName === cameraName).length > 1
+);
+
 await Promise.all(
-  Object.entries(videosByCamera).map(async ([camera, { videos }]) => {
-    const destinationFile = `${destinationFolder}/${sessionName}-${camera}.MP4`;
+  selectedVideos.map(async (video) => {
+    const { cameraName, chapterFilePaths, vidNumber, totalDuration } = video;
+    const destinationFile = areThereMultipleVideosFromTheSameCamera
+      ? `${destinationFolder}/${sessionName}-${cameraName}-${vidNumber}.MP4`
+      : `${destinationFolder}/${sessionName}-${cameraName}.MP4`;
+
     const destinationStat: Stats | null = await fs
       .stat(destinationFile)
       .catch(() => null);
 
-    if (videos.length === 1) {
-      const onlyVideo = videos[0];
+    if (chapterFilePaths.length === 1) {
+      const onlyVideo = chapterFilePaths[0];
       const sourceStat = await fs.stat(onlyVideo);
 
       if (destinationStat && sourceStat.size <= destinationStat.size) {
@@ -189,16 +269,11 @@ await Promise.all(
       return;
     }
 
-    let totalDuration = 0;
     const ffmpegCommand = ffmpeg();
-    for (const video of videos) {
-      totalDuration += +(await ffprobe(video)).format.duration;
-      ffmpegCommand.input(video);
-    }
+    for (const path of chapterFilePaths) ffmpegCommand.input(path);
 
     if (destinationStat) {
-      const destinationDuration = +(await ffprobe(destinationFile)).format
-        .duration;
+      const destinationDuration = await getDuration(destinationFile);
 
       if (~~destinationDuration === ~~totalDuration) {
         console.log(
@@ -216,20 +291,21 @@ await Promise.all(
     }
 
     let bar: ProgressBar;
-    await new Promise((resolve, reject) => {
+    await new Promise((resolve, reject) =>
       ffmpegCommand
-        .on("progress", (progress) => {
-          if (!bar) {
-            bar = multi.newBar(
-              `Concatenating ${destinationFile.replace(
-                destinationFolder + "/",
-                ""
-              )} [:bar] :percent :etas`,
-              { total: totalDuration }
-            );
+        .on("start", () => {
+          bar = multi.newBar(
+            `Concatenating ${destinationFile.replace(
+              destinationFolder + "/",
+              ""
+            )} [:bar] :percent :etas`,
+            { total: totalDuration }
+          );
+        })
+        .on("progress", ({ timemark }) => {
+          if (!bar.complete) {
+            bar.update(timemarkToSeconds(timemark) / totalDuration);
           }
-
-          bar.update(timemarkToSeconds(progress.timemark) / totalDuration);
         })
         .on("end", () => {
           bar.update(1);
@@ -237,8 +313,8 @@ await Promise.all(
           resolve(undefined);
         })
         .on("error", reject)
-        .mergeToFile(destinationFile, "/tmp");
-    });
+        .mergeToFile(destinationFile, "/tmp")
+    );
   })
 );
 
