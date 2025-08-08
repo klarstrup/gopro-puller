@@ -178,10 +178,10 @@ console.time("Getting video durations");
 await Promise.all(
   Object.keys(videosByVolume).map((volume) =>
     Promise.all(
-      videosByVolume[volume].map(({ chapterFilePaths, totalDuration }) =>
+      videosByVolume[volume].map((video) =>
         Promise.all(
-          chapterFilePaths.map((path) =>
-            getDuration(path).then((dur) => (totalDuration += dur))
+          video.chapterFilePaths.map((path) =>
+            getDuration(path).then((dur) => (video.totalDuration += dur))
           )
         )
       )
