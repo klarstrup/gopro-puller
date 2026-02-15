@@ -8,6 +8,10 @@ import Multiprogress from "multi-progress";
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 
+const sessionName = `2026-02-14-Exelerate-Studenterhuset`;
+//const destinationFolder = `~/Volumes/@klarstrup2/${sessionName}`;
+const destinationFolder = `./${sessionName}`;
+
 const getDuration = (target: string): Promise<number> =>
   new Promise((resolve, reject) =>
     execFile(
@@ -23,8 +27,8 @@ const getDuration = (target: string): Promise<number> =>
         } else {
           resolve(Number(JSON.parse(stdout).format.duration));
         }
-      }
-    )
+      },
+    ),
   );
 
 function timemarkToSeconds(timemark: string) {
@@ -79,18 +83,16 @@ async function getDeviceNameFromFile(videoPath: string): Promise<string> {
           .toString("utf8")
           .match(/DVNMc(.+)STRM/u)?.[1]
           ?.replace(/[^a-zA-Z0-9]/g, "");
+
         if (deviceName) {
           ffmpegCommand.kill("SIGKILL");
           resolve(deviceName);
         }
       })
-      .on("end", () => reject("Failed to get the camera name"));
+      .on("end", () => resolve("Unknown Device(Error)"));
   });
   return regexDeviceName || "Unknown Device";
 }
-
-const sessionName = `2025-08-07-Exelerate-HftH-Single-Guitar-Solos`;
-const destinationFolder = `/Volumes/@klarstrup2/${sessionName}`;
 
 const allVolumes = await fs.readdir(`/Volumes/`);
 const { selectedVolumes } = await inquirer.prompt<{
@@ -117,7 +119,7 @@ const videosByVolume: Record<
     cameraName: string;
     date: Date;
     vidNumber?: number;
-    totalDuration?: number;
+    totalDuration: number;
   }[]
 > = {};
 await Promise.all(
@@ -125,23 +127,18 @@ await Promise.all(
     if (!videosByVolume[volume]) videosByVolume[volume] = [];
 
     await Promise.all(
-      (
-        await fs.readdir(`/Volumes/${volume}/DCIM`)
-      )
+      (await fs.readdir(`/Volumes/${volume}/DCIM`))
         .filter((dir) => dir.startsWith("100"))
         .map(async (dir) =>
           Promise.all(
-            (
-              await fs.readdir(`/Volumes/${volume}/DCIM/${dir}`)
-            )
+            (await fs.readdir(`/Volumes/${volume}/DCIM/${dir}`))
               .filter((fileName) => fileName.endsWith(".MP4"))
               .map(async (fileName) => {
                 const filePath = `/Volumes/${volume}/DCIM/${dir}/${fileName}`;
                 const stats = await fs.stat(filePath);
 
-                const [, vidNumber] = fileName
-                  .match(/\d{2}(\d{4})/)
-                  .map(Number);
+                let [, vidNumber] =
+                  fileName.match(/\d{2}(\d{4})/)?.map(Number) || [];
 
                 let cameraName =
                   videosByVolume[volume].find((v) => v.vidNumber === vidNumber)
@@ -149,6 +146,11 @@ await Promise.all(
                   (dir.includes("GOPRO")
                     ? await getDeviceNameFromFile(filePath)
                     : "NikonZ30");
+
+                if (cameraName === "NikonZ30") {
+                  [, vidNumber] =
+                    fileName.match(/DSC_(\d{4})/)?.map(Number) || [];
+                }
 
                 if (
                   !videosByVolume[volume].some((v) => v.vidNumber === vidNumber)
@@ -164,13 +166,13 @@ await Promise.all(
                 }
 
                 videosByVolume[volume]
-                  .find((v) => v.vidNumber === vidNumber)
+                  .find((v) => v.vidNumber === vidNumber)!
                   .chapterFilePaths.push(filePath);
-              })
-          )
-        )
+              }),
+          ),
+        ),
     );
-  })
+  }),
 );
 console.timeEnd("Scan time");
 
@@ -181,13 +183,21 @@ await Promise.all(
       videosByVolume[volume].map((video) =>
         Promise.all(
           video.chapterFilePaths.map((path) =>
-            getDuration(path).then((dur) => (video.totalDuration += dur))
-          )
-        )
-      )
-    )
-  )
+            getDuration(path).then((dur) => (video.totalDuration += dur)),
+          ),
+        ),
+      ),
+    ),
+  ),
 );
+Object.keys(videosByVolume).forEach((volume) => {
+  if (!videosByVolume[volume].length) {
+    console.warn(`Warning: Disk \`${volume}\` has no videos on it.`);
+
+    delete videosByVolume[volume];
+  }
+});
+console.warn("");
 console.timeEnd("Getting video durations");
 
 const selections = await inquirer.prompt<
@@ -213,7 +223,7 @@ const selections = await inquirer.prompt<
         }. Vid No.: ${v.vidNumber}`,
         value: v,
       })),
-  }))
+  })),
 );
 const selectedVideos = Object.values(selections).flat();
 
@@ -226,7 +236,7 @@ console.log(`Copying videos to ${destinationFolder}...`);
 
 const areThereMultipleVideosFromTheSameCamera = selectedVideos.some(
   ({ cameraName }, _, videos) =>
-    videos.filter((v) => v.cameraName === cameraName).length > 1
+    videos.filter((v) => v.cameraName === cameraName).length > 1,
 );
 
 await Promise.all(
@@ -248,8 +258,8 @@ await Promise.all(
         console.log(
           `Already copied ${destinationFile.replace(
             destinationFolder + "/",
-            ""
-          )}`
+            "",
+          )}`,
         );
         return;
       }
@@ -257,9 +267,9 @@ await Promise.all(
       const bar = multi.newBar(
         `Copying ${destinationFile.replace(
           destinationFolder + "/",
-          ""
+          "",
         )} [:bar] :percent :etas`,
-        { total: sourceStat.size }
+        { total: sourceStat.size },
       );
 
       await copyFile(onlyVideo, destinationFile, {
@@ -270,7 +280,7 @@ await Promise.all(
     }
 
     const ffmpegCommand = ffmpeg();
-    for (const path of chapterFilePaths) ffmpegCommand.input(path);
+    for (const path of chapterFilePaths.sort()) ffmpegCommand.input(path);
 
     if (destinationStat) {
       const destinationDuration = await getDuration(destinationFile);
@@ -279,8 +289,8 @@ await Promise.all(
         console.log(
           `Already concatenated ${destinationFile.replace(
             destinationFolder + "/",
-            ""
-          )}`
+            "",
+          )}`,
         );
         return;
       }
@@ -297,9 +307,9 @@ await Promise.all(
           bar = multi.newBar(
             `Concatenating ${destinationFile.replace(
               destinationFolder + "/",
-              ""
+              "",
             )} [:bar] :percent :etas`,
-            { total: totalDuration }
+            { total: totalDuration },
           );
         })
         .on("progress", ({ timemark }) => {
@@ -313,9 +323,9 @@ await Promise.all(
           resolve(undefined);
         })
         .on("error", reject)
-        .mergeToFile(destinationFile, "/tmp")
+        .mergeToFile(destinationFile, "/tmp"),
     );
-  })
+  }),
 );
 
 console.timeEnd("Copy/Concatenate time");
