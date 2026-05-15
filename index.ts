@@ -8,7 +8,7 @@ import Multiprogress from "multi-progress";
 import { execFile } from "node:child_process";
 import fs from "node:fs/promises";
 
-const sessionName = `2026-02-14-Exelerate-Studenterhuset`;
+const sessionName = `2026-05-14-Exelerate-RUST`;
 //const destinationFolder = `~/Volumes/@klarstrup2/${sessionName}`;
 const destinationFolder = `./${sessionName}`;
 
@@ -128,7 +128,7 @@ await Promise.all(
 
     await Promise.all(
       (await fs.readdir(`/Volumes/${volume}/DCIM`))
-        .filter((dir) => dir.startsWith("100"))
+        .filter((dir) => dir.startsWith("100") || dir.startsWith("101"))
         .map(async (dir) =>
           Promise.all(
             (await fs.readdir(`/Volumes/${volume}/DCIM/${dir}`))
