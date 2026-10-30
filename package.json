@@ -2,7 +2,7 @@
   "name": "gopro-puller",
   "type": "module",
   "scripts": {
-    "ci": "bunx --package typescript-7 tsc --noEmit"
+    "ci": "bun check"
   },
   "dependencies": {
     "@ffmpeg-installer/ffmpeg": "^1.1.0",
